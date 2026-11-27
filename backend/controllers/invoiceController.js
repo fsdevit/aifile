@@ -168,21 +168,17 @@ export async function createInvoice(req, res) {
         ? String(body.invoiceNumber).trim()
         : null;
 
-    if (invoiceNumberProvided) {
-      const duplicate = await Invoice.exists({
-        invoiceNumber: invoiceNumberProvided,
-      });
-
+    // If the provided invoice number already exists, generate a new unique one
+    // instead of rejecting — this handles AI-generated duplicates gracefully
+    let invoiceNumber = invoiceNumberProvided || null;
+    if (invoiceNumber) {
+      const duplicate = await Invoice.exists({ invoiceNumber });
       if (duplicate) {
-        return res.status(409).json({
-          success: false,
-          message: "Invoice number already exists",
-        });
+        invoiceNumber = await generateUniqueInvoiceNumber();
       }
+    } else {
+      invoiceNumber = await generateUniqueInvoiceNumber();
     }
-
-    const invoiceNumber =
-      invoiceNumberProvided || (await generateUniqueInvoiceNumber());
 
     const doc = new Invoice({
       _id: new mongoose.Types.ObjectId(),
