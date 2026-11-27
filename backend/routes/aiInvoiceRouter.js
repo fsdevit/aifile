@@ -15,11 +15,13 @@ if (!API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
-// Use only valid/current model names you want to try
+// Use stable widely-available models first, then fallbacks
 const MODEL_CANDIDATES = [
+  "gemini-1.5-flash",
+  "gemini-1.5-flash-8b",
+  "gemini-1.5-pro",
+  "gemini-2.0-flash",
   "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.5-pro",
 ];
 
 function buildInvoicePrompt(promptText) {
@@ -248,7 +250,7 @@ aiInvoiceRouter.post("/generate", requireAuth, async (req, res) => {
 
       return res.status(502).json({
         success: false,
-        message: "AI generation failed.",
+        message: classified.message || "AI generation failed. All models exhausted.",
         errorType: classified.type,
         detail: classified.message,
       });
