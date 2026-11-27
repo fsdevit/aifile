@@ -1,5 +1,5 @@
 import express from "express";
-import { GoogleGenAI } from "@google/genai";
+import https from "https";
 import dotenv from "dotenv";
 import { requireAuth } from '../middleware/requireAuth.js';
 
@@ -7,21 +7,13 @@ dotenv.config();
 
 const aiInvoiceRouter = express.Router();
 
-const API_KEY = process.env.GEMINI_API_KEY;
-
-if (!API_KEY) {
-  console.warn("No Gemini API key found in .env");
-}
-
-const ai = new GoogleGenAI({ apiKey: API_KEY });
-
-// Use stable widely-available models first, then fallbacks
+// Models to try in order - confirmed available for new API keys
 const MODEL_CANDIDATES = [
-  "gemini-1.5-flash",
-  "gemini-1.5-flash-8b",
-  "gemini-1.5-pro",
-  "gemini-2.0-flash",
-  "gemini-2.5-flash",
+  "gemini-3.8-flash",
+  "gemini-3.5-flash",
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
+  "gemini-flash-latest",
 ];
 
 function buildInvoicePrompt(promptText) {
@@ -51,8 +43,7 @@ function buildInvoicePrompt(promptText) {
     notes: "",
   };
 
-  return `
-You are an invoice generation assistant.
+  return `You are an invoice generation assistant.
 
 Task:
 - Analyze the user's input text.
@@ -70,127 +61,86 @@ ${JSON.stringify(invoiceTemplate, null, 2)}
 User input:
 ${promptText}
 
-Return JSON only.
-`;
+Return JSON only.`;
 }
 
-function extractTextFromResponse(response) {
-  if (!response) return null;
+// Call Gemini REST API directly - no SDK needed
+function callGeminiRest(modelName, promptText, apiKey) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      contents: [{ parts: [{ text: promptText }] }]
+    });
 
-  if (typeof response.text === "string" && response.text.trim()) {
-    return response.text.trim();
-  }
+    const req = https.request({
+      hostname: "generativelanguage.googleapis.com",
+      path: `/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          if (res.statusCode !== 200) {
+            reject({ statusCode: res.statusCode, error: json?.error });
+            return;
+          }
+          // Extract text from response
+          const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) {
+            reject({ statusCode: res.statusCode, error: { message: "Empty response from model" } });
+            return;
+          }
+          resolve({ text, model: modelName });
+        } catch (e) {
+          reject({ statusCode: res.statusCode, error: { message: "Failed to parse Gemini response" } });
+        }
+      });
+    });
 
-  if (Array.isArray(response.candidates)) {
-    for (const candidate of response.candidates) {
-      const parts = candidate?.content?.parts;
-      if (Array.isArray(parts)) {
-        const joined = parts
-          .map((p) => (typeof p?.text === "string" ? p.text : ""))
-          .filter(Boolean)
-          .join("\n")
-          .trim();
-
-        if (joined) return joined;
-      }
-    }
-  }
-
-  try {
-    return JSON.stringify(response);
-  } catch {
-    return String(response);
-  }
-}
-
-function classifyGeminiError(err) {
-  const raw =
-    err?.message ||
-    err?.error?.message ||
-    err?.response?.data?.error?.message ||
-    JSON.stringify(err);
-
-  const text = String(raw);
-
-  if (
-    text.includes("reported as leaked") ||
-    text.includes("PERMISSION_DENIED")
-  ) {
-    return {
-      type: "LEAKED_KEY",
-      message:
-        "Your Gemini API key was reported as leaked or is blocked. Create a new API key and replace the old one in .env.",
-    };
-  }
-
-  if (
-    text.includes("RESOURCE_EXHAUSTED") ||
-    text.includes("quota") ||
-    text.includes("429")
-  ) {
-    return {
-      type: "QUOTA_EXCEEDED",
-      message:
-        "Gemini quota exceeded for this project/key. Check Google AI Studio quota and billing.",
-    };
-  }
-
-  if (
-    text.includes("NOT_FOUND") ||
-    text.includes("not found for API version") ||
-    text.includes("is not found")
-  ) {
-    return {
-      type: "MODEL_NOT_FOUND",
-      message: "The configured Gemini model name is invalid or unavailable.",
-    };
-  }
-
-  if (text.includes("API key not valid") || text.includes("invalid API key")) {
-    return {
-      type: "INVALID_KEY",
-      message: "Gemini API key is invalid.",
-    };
-  }
-
-  return {
-    type: "UNKNOWN",
-    message: text,
-  };
-}
-
-async function tryGenerateWithModel(modelName, prompt) {
-  const response = await ai.models.generateContent({
-    model: modelName,
-    contents: prompt,
+    req.on("error", (e) => reject({ statusCode: 0, error: { message: e.message } }));
+    req.write(body);
+    req.end();
   });
-
-  const text = extractTextFromResponse(response);
-
-  if (!text || !text.trim()) {
-    throw new Error(`Empty text returned from model ${modelName}`);
-  }
-
-  return { text: text.trim(), modelName };
 }
 
 function extractJsonObject(text) {
   const firstBrace = text.indexOf("{");
   const lastBrace = text.lastIndexOf("}");
-
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    return null;
-  }
-
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) return null;
   return text.slice(firstBrace, lastBrace + 1);
+}
+
+function classifyError(statusCode, error) {
+  const msg = error?.message || "";
+
+  if (statusCode === 429 || /RESOURCE_EXHAUSTED|quota/i.test(msg)) {
+    return { type: "QUOTA_EXCEEDED", message: "Gemini quota exceeded. Try again later." };
+  }
+  if (statusCode === 400 && /API key not valid|invalid.*key/i.test(msg)) {
+    return { type: "INVALID_KEY", message: "Gemini API key is invalid." };
+  }
+  if (statusCode === 403 || /PERMISSION_DENIED|leaked/i.test(msg)) {
+    return { type: "PERMISSION_DENIED", message: "Gemini API key is blocked or permission denied." };
+  }
+  if (statusCode === 404 || /NOT_FOUND|no longer available|not found/i.test(msg)) {
+    return { type: "MODEL_NOT_FOUND", message: `Model not available: ${msg}` };
+  }
+  return { type: "UNKNOWN", message: msg || `HTTP ${statusCode}` };
 }
 
 aiInvoiceRouter.post("/generate", requireAuth, async (req, res) => {
   try {
+    const API_KEY = process.env.GEMINI_API_KEY;
+
     if (!API_KEY) {
       return res.status(500).json({
         success: false,
-        message: "Server configuration failed: no Gemini API key found.",
+        message: "Server configuration error: GEMINI_API_KEY not set.",
       });
     }
 
@@ -206,89 +156,71 @@ aiInvoiceRouter.post("/generate", requireAuth, async (req, res) => {
     const fullPrompt = buildInvoicePrompt(String(prompt).trim());
 
     let lastError = null;
-    let lastText = null;
-    let usedModel = null;
-    let fatalError = null;
+    let result = null;
 
     for (const modelName of MODEL_CANDIDATES) {
       try {
-        const result = await tryGenerateWithModel(modelName, fullPrompt);
-        lastText = result.text;
-        usedModel = result.modelName;
+        console.log(`Trying model: ${modelName}`);
+        result = await callGeminiRest(modelName, fullPrompt, API_KEY);
+        console.log(`Success with model: ${modelName}`);
         break;
       } catch (err) {
-        const classified = classifyGeminiError(err);
+        const classified = classifyError(err.statusCode, err.error);
+        console.warn(`Model ${modelName} failed (${err.statusCode}):`, classified.message);
+        lastError = { ...err, classified };
 
-        console.warn(`Model ${modelName} failed:`, classified.message);
-
-        lastError = err;
-
-        // Stop immediately for key problems
-        if (
-          classified.type === "LEAKED_KEY" ||
-          classified.type === "INVALID_KEY"
-        ) {
-          fatalError = classified;
-          break;
+        // Stop immediately for fatal key errors
+        if (classified.type === "INVALID_KEY" || classified.type === "PERMISSION_DENIED") {
+          return res.status(502).json({
+            success: false,
+            message: classified.message,
+            errorType: classified.type,
+          });
         }
-
-        // For quota/model issues, try next model
+        // Otherwise try next model
         continue;
       }
     }
 
-    if (fatalError) {
+    if (!result) {
+      const classified = lastError?.classified || { message: "All models failed." };
       return res.status(502).json({
         success: false,
-        message: fatalError.message,
-        errorType: fatalError.type,
-      });
-    }
-
-    if (!lastText) {
-      const classified = classifyGeminiError(lastError);
-
-      return res.status(502).json({
-        success: false,
-        message: classified.message || "AI generation failed. All models exhausted.",
+        message: classified.message,
         errorType: classified.type,
-        detail: classified.message,
       });
     }
 
-    const jsonText = extractJsonObject(lastText);
-
+    const jsonText = extractJsonObject(result.text);
     if (!jsonText) {
       return res.status(502).json({
         success: false,
-        message: "AI returned malformed response: no JSON object found.",
-        model: usedModel,
-        raw: lastText,
+        message: "AI returned malformed response — no JSON found.",
+        model: result.model,
+        raw: result.text.slice(0, 500),
       });
     }
 
     let data;
     try {
       data = JSON.parse(jsonText);
-    } catch (parseErr) {
-      console.error("Failed to parse JSON from AI response:", parseErr);
-
+    } catch {
       return res.status(502).json({
         success: false,
         message: "AI returned invalid JSON.",
-        model: usedModel,
-        raw: lastText,
+        model: result.model,
+        raw: result.text.slice(0, 500),
       });
     }
 
     return res.status(200).json({
       success: true,
-      model: usedModel,
+      model: result.model,
       data,
     });
+
   } catch (err) {
     console.error("AI invoice generation error:", err);
-
     return res.status(500).json({
       success: false,
       message: "Internal server error during AI invoice generation.",
